@@ -45,6 +45,8 @@ type MerchantInterface interface {
 	AddAllotment(macAddress, metric string, amount uint64) (*CustomerSession, error)
 	// Wallet funding methods
 	Fund(cashuToken string) (uint64, error)
+	// Pre-auth: pay with a raw token + MAC, no Nostr event required
+	PreAuth(paymentToken string, macAddress string) (*CustomerSession, error)
 }
 
 // Merchant represents the financial decision maker for the tollgate
@@ -914,4 +916,49 @@ func (m *Merchant) Fund(cashuToken string) (uint64, error) {
 
 	log.Printf("Successfully funded wallet with %d sats", amountReceived)
 	return amountReceived, nil
+}
+
+func (m *Merchant) PreAuth(paymentToken string, macAddress string) (*CustomerSession, error) {
+	if !utils.ValidateMACAddress(macAddress) {
+		return nil, fmt.Errorf("invalid MAC address: %s", macAddress)
+	}
+
+	paymentCashuToken, err := cashu.DecodeToken(paymentToken)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cashu token: %w", err)
+	}
+
+	amountAfterSwap, err := m.tollwallet.Receive(paymentCashuToken)
+	if err != nil {
+		return nil, fmt.Errorf("payment processing failed: %w", err)
+	}
+
+	log.Printf("[preauth] Amount after swap: %d", amountAfterSwap)
+
+	mintURL := paymentCashuToken.Mint()
+	allotment, err := m.calculateAllotment(amountAfterSwap, mintURL)
+	if err != nil {
+		return nil, fmt.Errorf("allotment calculation failed: %w", err)
+	}
+
+	metric := "milliseconds"
+	session, err := m.AddAllotment(macAddress, metric, allotment)
+	if err != nil {
+		return nil, fmt.Errorf("session management failed: %w", err)
+	}
+
+	var endTimestamp int64
+	if session.Metric == "milliseconds" {
+		endTimestamp = session.StartTime + int64(session.Allotment/1000)
+	} else {
+		endTimestamp = time.Now().Unix() + (24 * 60 * 60)
+	}
+
+	err = valve.OpenGateUntil(macAddress, endTimestamp)
+	if err != nil {
+		return nil, fmt.Errorf("gate opening failed: %w", err)
+	}
+
+	log.Printf("[preauth] Gate opened for %s until %d (allotment: %d)", macAddress, endTimestamp, allotment)
+	return session, nil
 }

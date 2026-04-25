@@ -239,6 +239,54 @@ func CorsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func handleSession(w http.ResponseWriter, r *http.Request) {
+	mac := r.URL.Query().Get("mac")
+	if mac == "" {
+		var ip = getIP(r)
+		var err error
+		mac, err = getMacAddress(ip)
+		if err != nil {
+			mainLogger.WithError(err).Error("Error getting MAC address for /session")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if mac == "" || mac == "nil" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":"no active session","mac":""}`)
+		return
+	}
+
+	session, err := merchantInstance.GetSession(mac)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":"no active session","mac":"`+mac+`"}`)
+		return
+	}
+
+	now := time.Now().Unix()
+	var remaining int64
+	var totalSeconds int64
+	if session.Metric == "milliseconds" {
+		totalSeconds = int64(session.Allotment / 1000)
+		elapsed := now - session.StartTime
+		remaining = totalSeconds - elapsed
+		if remaining < 0 {
+			remaining = 0
+		}
+	} else {
+		totalSeconds = int64(session.Allotment)
+		remaining = totalSeconds
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"mac":"%s","metric":"%s","allotment":%d,"start_time":%d,"total_seconds":%d,"remaining_seconds":%d,"state":"active"}`,
+		mac, session.Metric, session.Allotment, session.StartTime, totalSeconds, remaining)
+}
+
 func handler(w http.ResponseWriter, r *http.Request) {
 	var ip = getIP(r)
 	var mac, err = getMacAddress(ip)
@@ -255,6 +303,72 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 func handleDetails(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, merchantInstance.GetAdvertisement())
+}
+
+type preAuthRequest struct {
+	Token string `json:"token"`
+	Mac   string `json:"mac"`
+}
+
+func handlePreAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		mainLogger.WithError(err).Error("[preauth] Error reading request body")
+		http.Error(w, `{"error":"failed to read body"}`, http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var req preAuthRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		mainLogger.WithError(err).Error("[preauth] Error parsing request")
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.Token == "" || req.Mac == "" {
+		http.Error(w, `{"error":"token and mac are required"}`, http.StatusBadRequest)
+		return
+	}
+
+	mainLogger.WithFields(logrus.Fields{
+		"mac":         req.Mac,
+		"token_len":   len(req.Token),
+		"remote_addr": r.RemoteAddr,
+	}).Info("[preauth] Processing pre-auth request")
+
+	session, err := merchantInstance.PreAuth(req.Token, req.Mac)
+	if err != nil {
+		mainLogger.WithError(err).Error("[preauth] Pre-auth failed")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"error":"%s"}`, strings.ReplaceAll(err.Error(), `"`, `\"`))
+		return
+	}
+
+	now := time.Now().Unix()
+	var remaining int64
+	var totalSeconds int64
+	if session.Metric == "milliseconds" {
+		totalSeconds = int64(session.Allotment / 1000)
+		remaining = totalSeconds - (now - session.StartTime)
+		if remaining < 0 {
+			remaining = 0
+		}
+	} else {
+		totalSeconds = int64(session.Allotment)
+		remaining = totalSeconds
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"success":true,"mac":"%s","metric":"%s","allotment":%d,"start_time":%d,"total_seconds":%d,"remaining_seconds":%d,"state":"active"}`,
+		session.MacAddress, session.Metric, session.Allotment, session.StartTime, totalSeconds, remaining)
 }
 
 // handleRootPost handles POST requests to the root endpoint
@@ -388,6 +502,16 @@ func main() {
 	http.HandleFunc("/whoami", func(w http.ResponseWriter, r *http.Request) {
 		mainLogger.WithField("remote_addr", r.RemoteAddr).Debug("Hit /whoami endpoint")
 		CorsMiddleware(handler)(w, r)
+	})
+
+	http.HandleFunc("/session", func(w http.ResponseWriter, r *http.Request) {
+		mainLogger.WithField("remote_addr", r.RemoteAddr).Debug("Hit /session endpoint")
+		CorsMiddleware(handleSession)(w, r)
+	})
+
+	http.HandleFunc("/preauth", func(w http.ResponseWriter, r *http.Request) {
+		mainLogger.WithField("remote_addr", r.RemoteAddr).Debug("Hit /preauth endpoint")
+		CorsMiddleware(handlePreAuth)(w, r)
 	})
 
 	mainLogger.Info("Starting HTTP server on all interfaces...")
