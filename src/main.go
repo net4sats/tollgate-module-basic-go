@@ -1,11 +1,12 @@
 package main
 
 import (
-	"context" // Added for context.Background()
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net" // Added for net.Interfaces()
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,19 +18,19 @@ import (
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/cli"
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/config_manager"
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/crowsnest"
-	"github.com/OpenTollGate/tollgate-module-basic-go/src/janitor"
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/merchant"
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/relay"
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/wireless_gateway_manager"
+	"github.com/fxamacker/cbor/v2"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/sirupsen/logrus"
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 // Module-level logger with pre-configured module field
 var mainLogger = logrus.WithField("module", "main")
 
-// Global configuration variable
-// Define configFile at a higher scope
+// Global configuration variables
 var (
 	configManager *config_manager.ConfigManager
 	mainConfig    *config_manager.Config
@@ -113,24 +114,11 @@ func init() {
 	// Initialize CLI server
 	initCLIServer()
 
-	// Initialize janitor module
-	// initJanitor()
-
 	// Initialize private relay
 	initPrivateRelay()
 
 	// Initialize crowsnest module
 	initCrowsnest()
-}
-
-func initJanitor() {
-	janitorInstance, err := janitor.NewJanitor(configManager)
-	if err != nil {
-		mainLogger.WithError(err).Fatal("Failed to create janitor instance")
-	}
-
-	go janitorInstance.ListenForNIP94Events()
-	mainLogger.Info("Janitor module initialized and listening for NIP-94 events")
 }
 
 func initPrivateRelay() {
@@ -209,10 +197,14 @@ func getMacAddress(ipAddress string) (string, error) {
 	var commandOutputString = string(commandOutput)
 	if err != nil {
 		fmt.Println(err, "Error when getting client's mac address. Command output: "+commandOutputString)
-		return "nil", err
+		return "", err
 	}
 
-	return strings.Trim(commandOutputString, "\n"), nil
+	mac := strings.Trim(commandOutputString, "\n")
+	if mac == "" {
+		return "", fmt.Errorf("no MAC address found in DHCP leases for IP %s", ipAddress)
+	}
+	return mac, nil
 }
 
 // CORS middleware to handle Cross-Origin Resource Sharing
@@ -226,7 +218,8 @@ func CorsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		// Set CORS headers
 		w.Header().Set("Access-Control-Allow-Origin", "*") // Allow any origin, or specify domains like "https://yourdomain.com"
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Cashu")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Cashu")
 
 		// Handle preflight OPTIONS requests
 		if r.Method == "OPTIONS" {
@@ -237,6 +230,20 @@ func CorsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		// Call the next handler
 		next(w, r)
 	}
+}
+
+func calcRemaining(metric string, allotment uint64, startTime int64) (totalSeconds, remaining int64) {
+	if metric == "milliseconds" {
+		totalSeconds = int64(allotment / 1000)
+		remaining = totalSeconds - (time.Now().Unix() - startTime)
+		if remaining < 0 {
+			remaining = 0
+		}
+	} else {
+		totalSeconds = int64(allotment)
+		remaining = totalSeconds
+	}
+	return
 }
 
 func handleSession(w http.ResponseWriter, r *http.Request) {
@@ -267,20 +274,7 @@ func handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now().Unix()
-	var remaining int64
-	var totalSeconds int64
-	if session.Metric == "milliseconds" {
-		totalSeconds = int64(session.Allotment / 1000)
-		elapsed := now - session.StartTime
-		remaining = totalSeconds - elapsed
-		if remaining < 0 {
-			remaining = 0
-		}
-	} else {
-		totalSeconds = int64(session.Allotment)
-		remaining = totalSeconds
-	}
+	totalSeconds, remaining := calcRemaining(session.Metric, session.Allotment, session.StartTime)
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"mac":"%s","metric":"%s","allotment":%d,"start_time":%d,"total_seconds":%d,"remaining_seconds":%d,"state":"active"}`,
@@ -292,12 +286,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	var mac, err = getMacAddress(ip)
 
 	if err != nil {
-		mainLogger.WithError(err).Error("Error getting MAC address")
+		mainLogger.WithFields(logrus.Fields{"ip": ip, "error": err}).Error("whoami: MAC lookup failed — IP not in DHCP leases")
 		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "error=mac_not_found")
 		return
 	}
 
-	fmt.Println("mac", mac)
+	mainLogger.WithFields(logrus.Fields{"ip": ip, "mac": mac}).Info("whoami: resolved MAC")
 	fmt.Fprint(w, "mac=", mac)
 }
 
@@ -305,70 +300,169 @@ func handleDetails(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, merchantInstance.GetAdvertisement())
 }
 
-type preAuthRequest struct {
-	Token string `json:"token"`
-	Mac   string `json:"mac"`
+type nut18PaymentRequest struct {
+	A int      `cbor:"a"`
+	U string   `cbor:"u"`
+	M []string `cbor:"m"`
 }
 
-func handlePreAuth(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+type nut18PaymentRequestWithTransport struct {
+	A int              `cbor:"a"`
+	U string           `cbor:"u"`
+	M []string         `cbor:"m"`
+	T []nut18Transport `cbor:"t,omitempty"`
+}
 
-	body, err := io.ReadAll(r.Body)
+type nut18Transport struct {
+	T string `cbor:"t"`
+	A string `cbor:"a"`
+}
+
+func encodePaymentRequest(req interface{}) (string, error) {
+	cborData, err := cbor.Marshal(req)
 	if err != nil {
-		mainLogger.WithError(err).Error("[preauth] Error reading request body")
-		http.Error(w, `{"error":"failed to read body"}`, http.StatusBadRequest)
-		return
+		return "", fmt.Errorf("cbor marshal: %w", err)
 	}
-	defer r.Body.Close()
+	return "creqA" + base64.RawURLEncoding.EncodeToString(cborData), nil
+}
 
-	var req preAuthRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		mainLogger.WithError(err).Error("[preauth] Error parsing request")
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
-		return
-	}
+type payTokenRequest struct {
+	Token string `json:"token"`
+}
 
-	if req.Token == "" || req.Mac == "" {
-		http.Error(w, `{"error":"token and mac are required"}`, http.StatusBadRequest)
-		return
-	}
+func handlePay(w http.ResponseWriter, r *http.Request) {
+	tokenHeader := r.Header.Get("X-Cashu")
 
-	mainLogger.WithFields(logrus.Fields{
-		"mac":         req.Mac,
-		"token_len":   len(req.Token),
-		"remote_addr": r.RemoteAddr,
-	}).Info("[preauth] Processing pre-auth request")
-
-	session, err := merchantInstance.PreAuth(req.Token, req.Mac)
-	if err != nil {
-		mainLogger.WithError(err).Error("[preauth] Pre-auth failed")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, `{"error":"%s"}`, strings.ReplaceAll(err.Error(), `"`, `\"`))
-		return
-	}
-
-	now := time.Now().Unix()
-	var remaining int64
-	var totalSeconds int64
-	if session.Metric == "milliseconds" {
-		totalSeconds = int64(session.Allotment / 1000)
-		remaining = totalSeconds - (now - session.StartTime)
-		if remaining < 0 {
-			remaining = 0
+	var token string
+	if r.Method == http.MethodPost {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			mainLogger.WithError(err).Error("[pay] Error reading request body")
+			http.Error(w, `{"error":"failed to read body"}`, http.StatusBadRequest)
+			return
 		}
-	} else {
-		totalSeconds = int64(session.Allotment)
-		remaining = totalSeconds
+		defer r.Body.Close()
+
+		if len(body) > 0 && (tokenHeader == "") {
+			var req payTokenRequest
+			if err := json.Unmarshal(body, &req); err == nil && req.Token != "" {
+				token = req.Token
+			}
+		}
 	}
 
+	if tokenHeader != "" && token == "" {
+		token = tokenHeader
+	}
+
+	if token != "" {
+		mac := r.URL.Query().Get("mac")
+		if mac == "" {
+			ip := getIP(r)
+			var err error
+			mac, err = getMacAddress(ip)
+			if err != nil || mac == "" || mac == "nil" {
+				mainLogger.WithError(err).WithField("ip", ip).Error("[pay] Cannot resolve MAC")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, `{"error":"cannot resolve device identity"}`)
+				return
+			}
+		}
+
+		mainLogger.WithFields(logrus.Fields{
+			"mac":       mac,
+			"token_len": len(token),
+		}).Info("[pay] Processing payment")
+
+		session, err := merchantInstance.PayWithToken(token, mac)
+		if err != nil {
+			mainLogger.WithError(err).Error("[pay] Payment failed")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error":"%s"}`, strings.ReplaceAll(err.Error(), `"`, `\"`))
+			return
+		}
+
+		totalSeconds, remaining := calcRemaining(session.Metric, session.Allotment, session.StartTime)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"success":true,"mac":"%s","metric":"%s","allotment":%d,"start_time":%d,"total_seconds":%d,"remaining_seconds":%d,"state":"active"}`,
+			session.MacAddress, session.Metric, session.Allotment, session.StartTime, totalSeconds, remaining)
+		return
+	}
+
+	mints := merchantInstance.GetAcceptedMints()
+	if len(mints) == 0 {
+		mainLogger.Error("[pay] No accepted mints configured")
+		http.Error(w, `{"error":"no accepted mints"}`, http.StatusInternalServerError)
+		return
+	}
+
+	minSteps := mints[0].MinPurchaseSteps
+	if minSteps == 0 {
+		minSteps = 1
+	}
+	minAmount := mints[0].PricePerStep * minSteps
+	mintURLs := make([]string, len(mints))
+	for i, m := range mints {
+		mintURLs[i] = m.URL
+	}
+
+	paymentReq := nut18PaymentRequest{
+		A: int(minAmount),
+		U: "sat",
+		M: mintURLs,
+	}
+	paymentReqStr, err := encodePaymentRequest(paymentReq)
+	if err != nil {
+		mainLogger.WithError(err).Error("[pay] Failed to encode payment request")
+		http.Error(w, `{"error":"encoding failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	host := r.Host
+	if fh := r.Header.Get("X-Forwarded-Host"); fh != "" {
+		host = fh
+	}
+	payURL := fmt.Sprintf("http://%s/pay", host)
+
+	qrReq := nut18PaymentRequestWithTransport{
+		A: int(minAmount),
+		U: "sat",
+		M: mintURLs,
+		T: []nut18Transport{{T: "post", A: payURL}},
+	}
+	qrCodeStr, err := encodePaymentRequest(qrReq)
+	if err != nil {
+		mainLogger.WithError(err).Error("[pay] Failed to encode QR payment request")
+		qrCodeStr = ""
+	}
+
+	var qrImage string
+	if qrCodeStr != "" {
+		png, err := qrcode.Encode(qrCodeStr, qrcode.Medium, 200)
+		if err != nil {
+			mainLogger.WithError(err).Error("[pay] Failed to generate QR PNG")
+		} else {
+			qrImage = "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+		}
+	}
+
+	w.Header().Set("X-Cashu", paymentReqStr)
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"success":true,"mac":"%s","metric":"%s","allotment":%d,"start_time":%d,"total_seconds":%d,"remaining_seconds":%d,"state":"active"}`,
-		session.MacAddress, session.Metric, session.Allotment, session.StartTime, totalSeconds, remaining)
+	w.WriteHeader(http.StatusPaymentRequired)
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"payment_request": paymentReqStr,
+		"qr_code":         qrCodeStr,
+		"qr_image":        qrImage,
+		"amount":          minAmount,
+		"unit":            "sat",
+		"mints":           mintURLs,
+		"pay_url":         payURL,
+	})
 }
 
 // handleRootPost handles POST requests to the root endpoint
@@ -422,7 +516,22 @@ func HandleRootPost(w http.ResponseWriter, r *http.Request) {
 		"created_at": event.CreatedAt,
 		"kind":       event.Kind,
 		"pubkey":     event.PubKey,
-	}).Info("Parsed nostr event")
+	}).Info("Parsed nostr event (signature not validated)")
+
+	// Log the event tags for debugging
+	for i, tag := range event.Tags {
+		if len(tag) >= 2 {
+			mainLogger.WithFields(logrus.Fields{
+				"tag_index": i,
+				"tag_name":  tag[0],
+				"tag_value": tag[1],
+			}).Debug("Event tag")
+			// Always log device-identifier and payment tags at info level
+			if tag[0] == "device-identifier" || tag[0] == "payment" {
+				log.Printf("HandleRootPost: tag[%d] %s=%q (len=%d)", i, tag[0], tag[1], len(tag[1]))
+			}
+		}
+	}
 
 	// Validate that this is a payment event (kind 21000)
 	if event.Kind != 21000 {
@@ -447,11 +556,28 @@ func HandleRootPost(w http.ResponseWriter, r *http.Request) {
 
 	// Check if the response is a notice event (kind 21023) or session event (kind 1022)
 	if responseEvent.Kind == 21023 {
-		// It's a notice event (error case), return with appropriate status
+		// Extract error code and message from tags for logging
+		var noticeCode, noticeMsg string
+		for _, tag := range responseEvent.Tags {
+			if len(tag) >= 2 && tag[0] == "code" {
+				noticeCode = tag[1]
+			}
+			if len(tag) >= 2 && tag[0] == "message" {
+				noticeMsg = tag[1]
+			}
+		}
+		mainLogger.WithFields(logrus.Fields{
+			"notice_code":    noticeCode,
+			"notice_message": noticeMsg,
+			"pubkey":         event.PubKey,
+		}).Warn("PurchaseSession returned notice (payment rejected)")
 		w.WriteHeader(http.StatusBadRequest)
 		err = json.NewEncoder(w).Encode(responseEvent)
 	} else {
-		// It's a session event (success case), return with OK status
+		mainLogger.WithFields(logrus.Fields{
+			"kind":   responseEvent.Kind,
+			"pubkey": event.PubKey,
+		}).Info("PurchaseSession succeeded — session event returned")
 		w.WriteHeader(http.StatusOK)
 		err = json.NewEncoder(w).Encode(responseEvent)
 	}
@@ -509,9 +635,14 @@ func main() {
 		CorsMiddleware(handleSession)(w, r)
 	})
 
-	http.HandleFunc("/preauth", func(w http.ResponseWriter, r *http.Request) {
-		mainLogger.WithField("remote_addr", r.RemoteAddr).Debug("Hit /preauth endpoint")
-		CorsMiddleware(handlePreAuth)(w, r)
+	http.HandleFunc("/pay", func(w http.ResponseWriter, r *http.Request) {
+		mainLogger.WithField("remote_addr", r.RemoteAddr).Debug("Hit /pay endpoint")
+		CorsMiddleware(handlePay)(w, r)
+	})
+
+	http.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
+		mainLogger.WithField("remote_addr", r.RemoteAddr).Debug("Hit /info endpoint")
+		CorsMiddleware(handleDetails)(w, r)
 	})
 
 	mainLogger.Info("Starting HTTP server on all interfaces...")
@@ -524,64 +655,6 @@ func main() {
 	}
 
 	mainLogger.Fatal(server.ListenAndServe())
-
-	go func() {
-		for {
-			if !isOnline() {
-				mainLogger.Info("Device is offline. Initiating gateway scan...")
-				// No need to assign the result of RunPeriodicScan, as it runs in a goroutine internally.
-				// We need to fetch the available gateways using GetAvailableGateways() instead.
-				availableGateways, err := gatewayManager.GetAvailableGateways()
-				if err != nil {
-					mainLogger.WithError(err).Error("Error getting available gateways")
-					continue
-				}
-				if len(availableGateways) > 0 {
-					mainLogger.Info("Available gateways found. Attempting to connect...")
-					err = gatewayManager.ConnectToGateway(availableGateways[0].BSSID, "") // Correct usage of ConnectToGateway
-					if err != nil {
-						mainLogger.WithError(err).Error("Error connecting to gateway")
-					} else {
-						mainLogger.Info("Successfully connected to a TollGate gateway.")
-					}
-				} else {
-					mainLogger.Info("No suitable TollGate gateways found to connect to.")
-				}
-			} else {
-				mainLogger.Debug("Device is online. No action needed.")
-			}
-			time.Sleep(5 * time.Minute)
-		}
-	}()
-
-	fmt.Println("Shutting down Tollgate - Whoami")
-}
-
-// isOnline checks if the device has at least one active, non-loopback network interface with an IP address.
-func isOnline() bool {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		mainLogger.WithError(err).Error("Error getting network interfaces")
-		return false
-	}
-
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 {
-			// Interface is up and not a loopback interface
-			addrs, err := iface.Addrs()
-			if err != nil {
-				mainLogger.WithFields(logrus.Fields{
-					"interface": iface.Name,
-					"error":     err,
-				}).Error("Error getting addresses for interface")
-				continue
-			}
-			if len(addrs) > 0 {
-				return true // Found at least one active, non-loopback interface with an IP address
-			}
-		}
-	}
-	return false
 }
 
 func getIP(r *http.Request) string {

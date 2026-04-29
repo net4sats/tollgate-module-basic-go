@@ -1,11 +1,13 @@
 package merchant
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,8 +47,8 @@ type MerchantInterface interface {
 	AddAllotment(macAddress, metric string, amount uint64) (*CustomerSession, error)
 	// Wallet funding methods
 	Fund(cashuToken string) (uint64, error)
-	// Pre-auth: pay with a raw token + MAC, no Nostr event required
-	PreAuth(paymentToken string, macAddress string) (*CustomerSession, error)
+	// Pay with raw cashu token + MAC, no Nostr event required
+	PayWithToken(paymentToken string, macAddress string) (*CustomerSession, error)
 }
 
 // Merchant represents the financial decision maker for the tollgate
@@ -55,9 +57,10 @@ type Merchant struct {
 	configManager *config_manager.ConfigManager
 	tollwallet    tollwallet.TollWallet
 	advertisement string
-	// In-memory session store
 	customerSessions map[string]*CustomerSession
 	sessionMu        sync.RWMutex
+	healthyMints     []config_manager.MintConfig
+	healthyMu        sync.RWMutex
 }
 
 func New(configManager *config_manager.ConfigManager) (MerchantInterface, error) {
@@ -86,14 +89,17 @@ func New(configManager *config_manager.ConfigManager) (MerchantInterface, error)
 	}
 	balance := tollwallet.GetBalance()
 
-	// Set advertisement
-	advertisementStr, err := CreateAdvertisement(configManager)
+	log.Printf("Accepted Mints: %v", config.AcceptedMints)
+	log.Printf("Wallet Balance: %d", balance)
+
+	healthyMints := probeMints(config.AcceptedMints)
+	log.Printf("Healthy Mints (%d/%d): %v", len(healthyMints), len(config.AcceptedMints), mintURLsFrom(healthyMints))
+
+	advertisementStr, err := CreateAdvertisementWithMints(configManager, healthyMints)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create advertisement: %w", err)
 	}
 
-	log.Printf("Accepted Mints: %v", config.AcceptedMints)
-	log.Printf("Wallet Balance: %d", balance)
 	log.Printf("Advertisement: %s", advertisementStr)
 	log.Printf("=== Merchant ready ===")
 
@@ -103,14 +109,20 @@ func New(configManager *config_manager.ConfigManager) (MerchantInterface, error)
 		tollwallet:       *tollwallet,
 		advertisement:    advertisementStr,
 		customerSessions: make(map[string]*CustomerSession),
+		healthyMints:     healthyMints,
 	}, nil
 }
 
 func (m *Merchant) StartPayoutRoutine() {
 	log.Printf("Starting payout routine")
 
-	// Create timer for each mint
-	for _, mint := range m.config.AcceptedMints {
+	m.StartMintHealthCheck()
+
+	m.healthyMu.RLock()
+	mints := m.healthyMints
+	m.healthyMu.RUnlock()
+
+	for _, mint := range mints {
 		go func(mintConfig config_manager.MintConfig) {
 			ticker := time.NewTicker(1 * time.Minute)
 			defer ticker.Stop()
@@ -184,6 +196,7 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 	// Extract payment token from payment event
 	paymentToken, err := m.extractPaymentToken(paymentEvent)
 	if err != nil {
+		log.Printf("PurchaseSession: extractPaymentToken failed: %v", err)
 		noticeEvent, noticeErr := m.CreateNoticeEvent("error", "invalid-payment-token",
 			fmt.Sprintf("Failed to extract payment token: %v", err), paymentEvent.PubKey)
 		if noticeErr != nil {
@@ -195,6 +208,7 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 	// Extract device identifier from payment event
 	deviceIdentifier, err := m.extractDeviceIdentifier(paymentEvent)
 	if err != nil {
+		log.Printf("PurchaseSession: extractDeviceIdentifier failed: %v", err)
 		noticeEvent, noticeErr := m.CreateNoticeEvent("error", "invalid-device-identifier",
 			fmt.Sprintf("Failed to extract device identifier: %v", err), paymentEvent.PubKey)
 		if noticeErr != nil {
@@ -203,8 +217,11 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 		return noticeEvent, nil
 	}
 
+	log.Printf("PurchaseSession: device identifier extracted: %q", deviceIdentifier)
+
 	// Validate MAC address
 	if !utils.ValidateMACAddress(deviceIdentifier) {
+		log.Printf("PurchaseSession: invalid MAC address: %q (empty or malformed)", deviceIdentifier)
 		noticeEvent, noticeErr := m.CreateNoticeEvent("error", "invalid-mac-address",
 			fmt.Sprintf("Invalid MAC address: %s", deviceIdentifier), paymentEvent.PubKey)
 		if noticeErr != nil {
@@ -213,9 +230,12 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 		return noticeEvent, nil
 	}
 
+	log.Printf("PurchaseSession: MAC address valid: %s", deviceIdentifier)
+
 	// Process payment
 	paymentCashuToken, err := cashu.DecodeToken(paymentToken)
 	if err != nil {
+		log.Printf("PurchaseSession: cashu.DecodeToken failed: %v", err)
 		noticeEvent, noticeErr := m.CreateNoticeEvent("error", "payment-error-invalid-token",
 			fmt.Sprintf("Invalid cashu token: %v", err), paymentEvent.PubKey)
 		if noticeErr != nil {
@@ -224,6 +244,7 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 		return noticeEvent, nil
 	}
 
+	log.Printf("PurchaseSession: calling Receive for mint %s mac %s", paymentCashuToken.Mint(), deviceIdentifier)
 	amountAfterSwap, err := m.tollwallet.Receive(paymentCashuToken)
 	if err != nil {
 		var errorCode string
@@ -238,6 +259,7 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 			errorMessage = fmt.Sprintf("Payment processing failed: %v", err)
 		}
 
+		log.Printf("PurchaseSession: Receive failed (code=%s): %v", errorCode, err)
 		noticeEvent, noticeErr := m.CreateNoticeEvent("error", errorCode, errorMessage, paymentEvent.PubKey)
 		if noticeErr != nil {
 			return nil, fmt.Errorf("payment processing failed and failed to create notice: %w", noticeErr)
@@ -245,12 +267,13 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 		return noticeEvent, nil
 	}
 
-	log.Printf("Amount after swap: %d", amountAfterSwap)
+	log.Printf("PurchaseSession: Amount after swap: %d sats for mac %s", amountAfterSwap, deviceIdentifier)
 
 	// Calculate allotment using the configured metric and mint-specific pricing
 	mintURL := paymentCashuToken.Mint()
 	allotment, err := m.calculateAllotment(amountAfterSwap, mintURL)
 	if err != nil {
+		log.Printf("PurchaseSession: calculateAllotment failed: %v", err)
 		noticeEvent, noticeErr := m.CreateNoticeEvent("error", "allotment-calculation-failed",
 			fmt.Sprintf("Failed to calculate allotment: %v", err), paymentEvent.PubKey)
 		if noticeErr != nil {
@@ -259,6 +282,8 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 		return noticeEvent, nil
 	}
 
+	log.Printf("PurchaseSession: allotment calculated: %d ms for mac %s", allotment, deviceIdentifier)
+
 	// Use MAC-address based session management
 	macAddress := deviceIdentifier
 
@@ -266,6 +291,7 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 	metric := "milliseconds" // Use milliseconds as default metric
 	session, err := m.AddAllotment(macAddress, metric, allotment)
 	if err != nil {
+		log.Printf("PurchaseSession: AddAllotment failed: %v", err)
 		noticeEvent, noticeErr := m.CreateNoticeEvent("error", "session-management-failed",
 			fmt.Sprintf("Failed to manage session: %v", err), paymentEvent.PubKey)
 		if noticeErr != nil {
@@ -283,9 +309,12 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 		endTimestamp = time.Now().Unix() + (24 * 60 * 60) // 24 hours from now
 	}
 
+	log.Printf("PurchaseSession: opening gate for mac %s until %d", macAddress, endTimestamp)
+
 	// Open gate until the calculated end time
 	err = valve.OpenGateUntil(macAddress, endTimestamp)
 	if err != nil {
+		log.Printf("PurchaseSession: OpenGateUntil failed for mac %s: %v", macAddress, err)
 		noticeEvent, noticeErr := m.CreateNoticeEvent("error", "gate-opening-failed",
 			fmt.Sprintf("Failed to open gate for session: %v", err), paymentEvent.PubKey)
 		if noticeErr != nil {
@@ -293,6 +322,8 @@ func (m *Merchant) PurchaseSession(paymentEvent nostr.Event) (*nostr.Event, erro
 		}
 		return noticeEvent, nil
 	}
+
+	log.Printf("PurchaseSession: gate opened successfully for mac %s", macAddress)
 
 	// Create a success notice event
 	sessionEvent, err := m.createSessionEvent(session, paymentEvent.PubKey)
@@ -312,6 +343,14 @@ func CreateAdvertisement(configManager *config_manager.ConfigManager) (string, e
 	if config == nil {
 		return "", fmt.Errorf("main config is nil")
 	}
+	return CreateAdvertisementWithMints(configManager, config.AcceptedMints)
+}
+
+func CreateAdvertisementWithMints(configManager *config_manager.ConfigManager, mints []config_manager.MintConfig) (string, error) {
+	config := configManager.GetConfig()
+	if config == nil {
+		return "", fmt.Errorf("main config is nil")
+	}
 
 	advertisementEvent := nostr.Event{
 		Kind: 10021,
@@ -323,8 +362,7 @@ func CreateAdvertisement(configManager *config_manager.ConfigManager) (string, e
 		Content: "",
 	}
 
-	// Create a map of prices mints and their fees
-	for _, mintConfig := range config.AcceptedMints {
+	for _, mintConfig := range mints {
 		advertisementEvent.Tags = append(advertisementEvent.Tags, nostr.Tag{
 			"price_per_step",
 			"cashu",
@@ -835,7 +873,78 @@ func (m *Merchant) CreatePaymentTokenWithOverpayment(mintURL string, amount uint
 
 // GetAcceptedMints returns the list of accepted mints from the configuration
 func (m *Merchant) GetAcceptedMints() []config_manager.MintConfig {
+	m.healthyMu.RLock()
+	defer m.healthyMu.RUnlock()
+	if len(m.healthyMints) > 0 {
+		return m.healthyMints
+	}
 	return m.config.AcceptedMints
+}
+
+func (m *Merchant) GetHealthyMints() []config_manager.MintConfig {
+	m.healthyMu.RLock()
+	defer m.healthyMu.RUnlock()
+	return m.healthyMints
+}
+
+func probeMints(mints []config_manager.MintConfig) []config_manager.MintConfig {
+	var healthy []config_manager.MintConfig
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: false,
+			},
+		},
+	}
+	for _, mint := range mints {
+		url := mint.URL + "/v1/keys"
+		resp, err := client.Get(url)
+		if err != nil {
+			log.Printf("Mint health check FAILED for %s: %v", mint.URL, err)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+			log.Printf("Mint health check OK for %s (HTTP %d)", mint.URL, resp.StatusCode)
+			healthy = append(healthy, mint)
+		} else {
+			log.Printf("Mint health check FAILED for %s (HTTP %d)", mint.URL, resp.StatusCode)
+		}
+	}
+	return healthy
+}
+
+func mintURLsFrom(mints []config_manager.MintConfig) []string {
+	urls := make([]string, len(mints))
+	for i, m := range mints {
+		urls[i] = m.URL
+	}
+	return urls
+}
+
+func (m *Merchant) refreshHealthyMints() {
+	healthy := probeMints(m.config.AcceptedMints)
+	m.healthyMu.Lock()
+	m.healthyMints = healthy
+	m.healthyMu.Unlock()
+
+	advertisementStr, err := CreateAdvertisementWithMints(m.configManager, healthy)
+	if err == nil {
+		m.advertisement = advertisementStr
+	}
+	log.Printf("Mint health refresh: %d/%d healthy: %v", len(healthy), len(m.config.AcceptedMints), mintURLsFrom(healthy))
+}
+
+func (m *Merchant) StartMintHealthCheck() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			m.refreshHealthyMints()
+		}
+	}()
+	log.Printf("Mint health check started (every 5m)")
 }
 
 // GetBalance returns the total balance across all mints
@@ -918,7 +1027,7 @@ func (m *Merchant) Fund(cashuToken string) (uint64, error) {
 	return amountReceived, nil
 }
 
-func (m *Merchant) PreAuth(paymentToken string, macAddress string) (*CustomerSession, error) {
+func (m *Merchant) PayWithToken(paymentToken string, macAddress string) (*CustomerSession, error) {
 	if !utils.ValidateMACAddress(macAddress) {
 		return nil, fmt.Errorf("invalid MAC address: %s", macAddress)
 	}
@@ -933,7 +1042,7 @@ func (m *Merchant) PreAuth(paymentToken string, macAddress string) (*CustomerSes
 		return nil, fmt.Errorf("payment processing failed: %w", err)
 	}
 
-	log.Printf("[preauth] Amount after swap: %d", amountAfterSwap)
+	log.Printf("[pay] Amount after swap: %d", amountAfterSwap)
 
 	mintURL := paymentCashuToken.Mint()
 	allotment, err := m.calculateAllotment(amountAfterSwap, mintURL)
@@ -959,6 +1068,6 @@ func (m *Merchant) PreAuth(paymentToken string, macAddress string) (*CustomerSes
 		return nil, fmt.Errorf("gate opening failed: %w", err)
 	}
 
-	log.Printf("[preauth] Gate opened for %s until %d (allotment: %d)", macAddress, endTimestamp, allotment)
+	log.Printf("[pay] Gate opened for %s until %d (allotment: %d)", macAddress, endTimestamp, allotment)
 	return session, nil
 }

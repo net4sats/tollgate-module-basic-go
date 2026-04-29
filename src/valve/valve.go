@@ -83,11 +83,24 @@ func OpenGateUntil(macAddress string, untilTimestamp int64) error {
 
 	// Always authorize with ndsctl even if we think it's already authorized
 	// (ndsctl state can get out of sync with our in-memory map)
-	err := authorizeMAC(macAddress)
-	if err != nil {
+	// Retry up to 3 times with 2s delay — the client may not be in NDS yet
+	var authErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		authErr = authorizeMAC(macAddress)
+		if authErr == nil {
+			break
+		}
 		logger.WithFields(logrus.Fields{
 			"mac_address": macAddress,
-		}).Warn("ndsctl auth failed (may already be authenticated)")
+			"attempt":     attempt,
+		}).Warn("ndsctl auth failed, retrying in 2s...")
+		time.Sleep(2 * time.Second)
+	}
+	if authErr != nil {
+		logger.WithFields(logrus.Fields{
+			"mac_address": macAddress,
+		}).Error("ndsctl auth failed after 3 retries — gate NOT opened")
+		return authErr
 	}
 
 	if !exists {
