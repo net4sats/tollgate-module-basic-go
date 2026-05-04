@@ -1,6 +1,6 @@
 module github.com/OpenTollgate/tollgate-module-basic-go/src
 
-go 1.23.3
+go 1.23.7
 
 require github.com/nbd-wtf/go-nostr v0.51.3
 
@@ -36,3 +36,5 @@ require (
 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394 // indirect
 	golang.org/x/sys v0.31.0 // indirect
 )
+
+replace github.com/elnosh/gonuts => github.com/Amperstrand/gonuts v0.0.0-20260504172108-a0f543e14736
