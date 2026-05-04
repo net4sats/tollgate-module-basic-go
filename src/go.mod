@@ -27,6 +27,8 @@ replace (
 	github.com/OpenTollGate/tollgate-module-basic-go/src/wireless_gateway_manager => ./wireless_gateway_manager
 )
 
+replace github.com/Origami74/gonuts-tollgate => github.com/Amperstrand/gonuts-tollgate v0.6.2
+
 require (
 	github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 // indirect
 	github.com/OpenTollGate/tollgate-module-basic-go/src/lightning v0.0.0-00010101000000-000000000000 // indirect

@@ -3,7 +3,7 @@ PKG_MAKEFILE_DIR:=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=tollgate-wrt
-TOLLGATE_PKG_SOURCE_URL?=https://github.com/OpenTollGate/tollgate-module-basic-go.git
+TOLLGATE_PKG_SOURCE_URL?=https://github.com/Amperstrand/tollgate-module-basic-go.git
 TOLLGATE_DISPLAY_VERSION:=$(if $(strip $(PACKAGE_VERSION)),$(PACKAGE_VERSION),0.0.0)
 
 ifeq ($(CONFIG_USE_APK),y)
