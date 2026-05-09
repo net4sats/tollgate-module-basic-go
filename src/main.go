@@ -155,6 +155,9 @@ func initCLIServer() {
 }
 
 func getMacAddress(ipAddress string) (string, error) {
+	if net.ParseIP(ipAddress) == nil {
+		return "", fmt.Errorf("invalid IP address: %s", ipAddress)
+	}
 	data, err := os.ReadFile("/tmp/dhcp.leases")
 	if err != nil {
 		return "", fmt.Errorf("reading dhcp leases: %w", err)
@@ -461,25 +464,32 @@ func isOnline() bool {
 	return false
 }
 
-func getIP(r *http.Request) string {
-	// Check if the IP is set in the X-Real-Ip header
-	ip := r.Header.Get("X-Real-Ip")
-	if ip != "" {
-		return ip
+func isLocalRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
 	}
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
+}
 
-	// Check if the IP is set in the X-Forwarded-For header
-	ips := r.Header.Get("X-Forwarded-For")
-	if ips != "" {
-		return strings.Split(ips, ",")[0]
+func getIP(r *http.Request) string {
+	// Only trust proxy headers from localhost (uhttpd CGI → backend)
+	if isLocalRequest(r) {
+		ip := r.Header.Get("X-Real-Ip")
+		if ip != "" {
+			return ip
+		}
+		ips := r.Header.Get("X-Forwarded-For")
+		if ips != "" {
+			return strings.Split(ips, ",")[0]
+		}
 	}
 
 	// Fallback to the remote address, removing the port
-	ip = r.RemoteAddr
+	ip := r.RemoteAddr
 	if colon := strings.LastIndex(ip, ":"); colon != -1 {
 		ip = ip[:colon]
 	}
-
 	return ip
 }
 

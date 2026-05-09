@@ -88,15 +88,19 @@ func OpenGateUntil(macAddress string, untilTimestamp int64) error {
 	gatesMutex.Lock()
 	defer gatesMutex.Unlock()
 
+	// Always authorize with ndsctl even if we think it's already authorized
+	// (ndsctl state can get out of sync with our in-memory map)
+	err := authorizeMAC(macAddress)
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"mac_address": macAddress,
+		}).Warn("ndsctl auth failed (may already be authenticated)")
+	}
+
 	// Check if the MAC is already in openGates
 	existingTimer, exists := openGates[macAddress]
 
 	if !exists {
-		// MAC not in openGates, authorize it
-		err := authorizeMAC(macAddress)
-		if err != nil {
-			return fmt.Errorf("error authorizing MAC: %w", err)
-		}
 		logger.WithFields(logrus.Fields{
 			"mac_address": macAddress,
 		}).Debug("New authorization for MAC")
