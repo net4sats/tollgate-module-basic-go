@@ -30,14 +30,14 @@ setup_uhttpd() {
     uci -q delete uhttpd.main.listen_https
     uci -q delete uhttpd.main.cert
     uci -q delete uhttpd.main.key
-    # Only enable HTTPS if cert and key files exist; otherwise uhttpd
-    # crash-loops because it sees listen_https but has no TLS config.
-    if [ -f /etc/uhttpd.crt ] && [ -f /etc/uhttpd.key ]; then
-        uci add_list uhttpd.main.listen_https='0.0.0.0:443'
-        uci add_list uhttpd.main.listen_https='[::]:443'
-        uci set uhttpd.main.cert='/etc/uhttpd.crt'
-        uci set uhttpd.main.key='/etc/uhttpd.key'
-    fi
+    # Configure HTTPS listener unconditionally.  uhttpd's init script
+    # (generate_keys via config_foreach) creates the cert/key files from
+    # the uhttpd.defaults UCI section on first service start if they are
+    # absent, so they will exist by the time uhttpd actually binds.
+    uci add_list uhttpd.main.listen_https='0.0.0.0:443'
+    uci add_list uhttpd.main.listen_https='[::]:443'
+    uci set uhttpd.main.cert='/etc/uhttpd.crt'
+    uci set uhttpd.main.key='/etc/uhttpd.key'
     uci set uhttpd.main.redirect_https='0'
     uci set uhttpd.main.home='/www'
     uci set uhttpd.main.rfc1918_filter='1'
