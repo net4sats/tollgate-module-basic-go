@@ -161,6 +161,13 @@ setup_tollgate_firewall_rules() {
         uci set firewall.@rule[-1].dest_port='2121'
         uci set firewall.@rule[-1].target='ACCEPT'
     fi
+    # WAN→router: HTTPS (self-signed cert for captive portal).
+    uci set firewall.allow_https_wan='rule'
+    uci set firewall.allow_https_wan.name='Allow-HTTPS-WAN'
+    uci set firewall.allow_https_wan.src='wan'
+    uci set firewall.allow_https_wan.proto='tcp'
+    uci set firewall.allow_https_wan.dest_port='443'
+    uci set firewall.allow_https_wan.target='ACCEPT'
     # LAN→router: same port, for local clients.
     uci set firewall.tollgate_in='rule'
     uci set firewall.tollgate_in.name='Allow-TollGate-In'
