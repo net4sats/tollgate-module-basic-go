@@ -18,6 +18,7 @@ type Config struct {
 	Metric                 string                       `json:"metric"`
 	ShowSetup              bool                         `json:"show_setup"`
 	ResellerMode           bool                         `json:"reseller_mode"`
+	RedirectURL            string                       `json:"redirect_url,omitempty"`
 	UpstreamDetector       UpstreamDetectorConfig       `json:"upstream_detector"`
 	UpstreamSessionManager UpstreamSessionManagerConfig `json:"upstream_session_manager"`
 	UpstreamWifi           UpstreamWifiConfig           `json:"upstream_wifi"`

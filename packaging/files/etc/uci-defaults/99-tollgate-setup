@@ -100,6 +100,12 @@ setup_nodogsplash() {
     uci set nodogsplash.@nodogsplash[0].gatewayinterface='br-lan'
     uci add_list nodogsplash.@nodogsplash[0].users_to_router='allow tcp port 2121'
     uci add_list nodogsplash.@nodogsplash[0].users_to_router='allow tcp port 8080'
+
+    # Post-payment redirect: after NDS authenticates the client, redirect
+    # to this URL in the user's real browser (Android closes the captive
+    # portal WebView and opens the URL in Chrome).  Can be overridden at
+    # runtime via: uci set nodogsplash.@nodogsplash[0].redirecturl='<url>'
+    uci set nodogsplash.@nodogsplash[0].redirecturl='https://wallet.cashu.me/welcome'
 }
 
 setup_tollgate_firewall_rules() {
