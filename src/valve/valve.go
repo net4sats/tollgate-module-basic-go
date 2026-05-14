@@ -13,6 +13,11 @@ import (
 // Module-level logger with pre-configured module field
 var logger = logrus.WithField("module", "valve")
 
+// AuthDelay controls a delay before ndsctl auth, giving the captive portal
+// time to load a redirect page before Android detects connectivity and
+// closes the WebView. Set to 0 (default) for immediate auth.
+var AuthDelay time.Duration
+
 // openGates keeps track of MAC addresses that have been authorized
 var (
 	openGates  = make(map[string]*time.Timer)
@@ -92,14 +97,21 @@ func OpenGateUntil(macAddress string, untilTimestamp int64) error {
 	existingTimer, exists := openGates[macAddress]
 
 	if !exists {
-		// MAC not in openGates, authorize it
-		err := authorizeMAC(macAddress)
-		if err != nil {
-			return fmt.Errorf("error authorizing MAC: %w", err)
+		if AuthDelay > 0 {
+			go delayedAuth(macAddress, untilTimestamp, durationSeconds)
+			logger.WithFields(logrus.Fields{
+				"mac_address": macAddress,
+				"delay":       AuthDelay,
+			}).Info("Scheduled delayed auth for redirect")
+		} else {
+			err := authorizeMAC(macAddress)
+			if err != nil {
+				return fmt.Errorf("error authorizing MAC: %w", err)
+			}
+			logger.WithFields(logrus.Fields{
+				"mac_address": macAddress,
+			}).Debug("New authorization for MAC")
 		}
-		logger.WithFields(logrus.Fields{
-			"mac_address": macAddress,
-		}).Debug("New authorization for MAC")
 	} else {
 		// MAC already in openGates, stop the existing timer
 		if existingTimer != nil {
@@ -152,18 +164,25 @@ func OpenGate(macAddress string) error {
 		logger.WithField("mac_address", macAddress).Info("Replacing existing timed gate with indefinite data-based gate.")
 	}
 
-	err := authorizeMAC(macAddress)
-	if err != nil {
-		return err
-	}
-
-	// Set data baseline for tracking
-	err = SetDataBaseline(macAddress)
-	if err != nil {
+	if AuthDelay > 0 {
+		go delayedAuthIndefinite(macAddress)
 		logger.WithFields(logrus.Fields{
 			"mac_address": macAddress,
-			"error":       err,
-		}).Warn("Failed to set data baseline, continuing anyway")
+			"delay":       AuthDelay,
+		}).Info("Scheduled delayed auth for redirect")
+	} else {
+		err := authorizeMAC(macAddress)
+		if err != nil {
+			return err
+		}
+
+		err = SetDataBaseline(macAddress)
+		if err != nil {
+			logger.WithFields(logrus.Fields{
+				"mac_address": macAddress,
+				"error":       err,
+			}).Warn("Failed to set data baseline, continuing anyway")
+		}
 	}
 
 	// Store a nil timer to indicate an indefinite gate
@@ -268,4 +287,69 @@ func GetClientUsage(macAddress string) (totalBytes uint64, err error) {
 		return 0, err
 	}
 	return downloaded + uploaded, nil
+}
+
+func delayedAuth(macAddress string, untilTimestamp int64, durationSeconds int64) {
+	logger.WithFields(logrus.Fields{
+		"mac_address": macAddress,
+		"delay":       AuthDelay,
+	}).Info("Waiting before delayed auth")
+	time.Sleep(AuthDelay)
+
+	if err := authorizeMAC(macAddress); err != nil {
+		logger.WithFields(logrus.Fields{
+			"mac_address": macAddress,
+			"error":       err,
+		}).Error("Delayed auth failed")
+		return
+	}
+
+	logger.WithFields(logrus.Fields{
+		"mac_address": macAddress,
+	}).Info("Delayed auth succeeded")
+
+	duration := time.Duration(durationSeconds) * time.Second
+	timer := time.AfterFunc(duration, func() {
+		if err := deauthorizeMAC(macAddress); err != nil {
+			logger.WithField("mac_address", macAddress).Error("Error deauthorizing after timeout")
+		}
+		gatesMutex.Lock()
+		delete(openGates, macAddress)
+		gatesMutex.Unlock()
+	})
+
+	gatesMutex.Lock()
+	openGates[macAddress] = timer
+	gatesMutex.Unlock()
+}
+
+func delayedAuthIndefinite(macAddress string) {
+	logger.WithFields(logrus.Fields{
+		"mac_address": macAddress,
+		"delay":       AuthDelay,
+	}).Info("Waiting before delayed auth")
+	time.Sleep(AuthDelay)
+
+	if err := authorizeMAC(macAddress); err != nil {
+		logger.WithFields(logrus.Fields{
+			"mac_address": macAddress,
+			"error":       err,
+		}).Error("Delayed auth failed")
+		return
+	}
+
+	logger.WithFields(logrus.Fields{
+		"mac_address": macAddress,
+	}).Info("Delayed auth succeeded")
+
+	if err := SetDataBaseline(macAddress); err != nil {
+		logger.WithFields(logrus.Fields{
+			"mac_address": macAddress,
+			"error":       err,
+		}).Warn("Failed to set data baseline, continuing anyway")
+	}
+
+	gatesMutex.Lock()
+	openGates[macAddress] = nil
+	gatesMutex.Unlock()
 }

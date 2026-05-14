@@ -19,6 +19,7 @@ import (
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/merchant"
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/upstream_detector"
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/upstream_session_manager"
+	"github.com/OpenTollGate/tollgate-module-basic-go/src/valve"
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/wireless_gateway_manager"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -95,6 +96,14 @@ func init() {
 	mainConfig = configManager.GetConfig()
 
 	InitializeGlobalLogger(mainConfig.LogLevel)
+
+	if mainConfig.RedirectURL != "" {
+		valve.AuthDelay = 8 * time.Second
+		mainLogger.WithFields(logrus.Fields{
+			"redirect_url": mainConfig.RedirectURL,
+			"auth_delay":   valve.AuthDelay,
+		}).Info("Post-payment redirect enabled, delaying auth for redirect chain")
+	}
 
 	sharedConnector = &wireless_gateway_manager.Connector{}
 	if mainConfig != nil && mainConfig.UpstreamWifi.DHCPTimeoutSeconds > 0 {
