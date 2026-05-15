@@ -19,6 +19,7 @@ type Config struct {
 	ShowSetup              bool                         `json:"show_setup"`
 	ResellerMode           bool                         `json:"reseller_mode"`
 	RedirectURL            string                       `json:"redirect_url,omitempty"`
+	AuthDelaySeconds       int                          `json:"auth_delay_seconds,omitempty"`
 	UpstreamDetector       UpstreamDetectorConfig       `json:"upstream_detector"`
 	UpstreamSessionManager UpstreamSessionManagerConfig `json:"upstream_session_manager"`
 	UpstreamWifi           UpstreamWifiConfig           `json:"upstream_wifi"`
