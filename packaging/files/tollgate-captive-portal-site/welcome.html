@@ -86,15 +86,20 @@
                 log.scrollTop = log.scrollHeight;
             }
 
+            function toIntentUrl(url) {
+                var u = new URL(url);
+                var host = u.host;
+                var path = u.pathname + u.search + u.hash;
+                return 'intent://' + path + '#Intent;scheme=' + u.protocol.replace(':', '') + ';package=com.android.chrome;S.browser_fallback_url=' + encodeURIComponent(url) + ';end';
+            }
+
             function redirect() {
                 countdownEl.textContent = '0';
                 statusEl.textContent = 'Redirecting...';
                 addLog('Redirecting to ' + TARGET);
 
                 try {
-                    window.location.href = 'intent://'
-                        + TARGET.replace('https://', '').replace('http://', '')
-                        + '#Intent;scheme=https;package=com.android.chrome;end';
+                    window.location.href = toIntentUrl(TARGET);
                     addLog('Intent URL dispatched (Android Chrome)');
                 } catch(e) {
                     addLog('Intent failed: ' + e.message);

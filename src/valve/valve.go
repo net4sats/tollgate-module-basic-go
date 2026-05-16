@@ -18,6 +18,9 @@ var logger = logrus.WithField("module", "valve")
 // closes the WebView. Set to 0 (default) for immediate auth.
 var AuthDelay time.Duration
 
+// stopCh is closed by Stop() to cancel all in-flight delayed auth goroutines.
+var stopCh = make(chan struct{})
+
 // openGates keeps track of MAC addresses that have been authorized.
 // pendingUntil stores target deauth timestamps for MACs awaiting delayed auth,
 // so extensions during the delay window are preserved (fixes concurrent payment bug).
@@ -29,6 +32,10 @@ var (
 
 // ndsctlMutex ensures only one ndsctl command runs at a time
 var ndsctlMutex = &sync.Mutex{}
+
+func Stop() {
+	close(stopCh)
+}
 
 // authorizeMAC authorizes a MAC address using ndsctl
 func authorizeMAC(macAddress string) error {
@@ -308,7 +315,17 @@ func delayedAuth(macAddress string) {
 		"mac_address": macAddress,
 		"delay":       AuthDelay,
 	}).Info("Waiting before delayed auth")
-	time.Sleep(AuthDelay)
+
+	select {
+	case <-time.After(AuthDelay):
+	case <-stopCh:
+		logger.WithField("mac_address", macAddress).Info("Delayed auth cancelled during shutdown")
+		gatesMutex.Lock()
+		delete(pendingUntil, macAddress)
+		delete(openGates, macAddress)
+		gatesMutex.Unlock()
+		return
+	}
 
 	gatesMutex.Lock()
 	untilTimestamp, pending := pendingUntil[macAddress]
@@ -367,7 +384,17 @@ func delayedAuthIndefinite(macAddress string) {
 		"mac_address": macAddress,
 		"delay":       AuthDelay,
 	}).Info("Waiting before delayed auth")
-	time.Sleep(AuthDelay)
+
+	select {
+	case <-time.After(AuthDelay):
+	case <-stopCh:
+		logger.WithField("mac_address", macAddress).Info("Delayed indefinite auth cancelled during shutdown")
+		gatesMutex.Lock()
+		delete(pendingUntil, macAddress)
+		delete(openGates, macAddress)
+		gatesMutex.Unlock()
+		return
+	}
 
 	gatesMutex.Lock()
 	_, pending := pendingUntil[macAddress]
