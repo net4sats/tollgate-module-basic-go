@@ -14,28 +14,18 @@
             display: flex;
             flex-direction: column;
             align-items: center;
+            justify-content: center;
             padding: 2rem 1rem;
         }
         h1 { font-size: 1.5rem; margin-bottom: 0.5rem; text-align: center; }
         .subtitle { color: #999; margin-bottom: 2rem; text-align: center; }
-        .approach {
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 12px;
-            padding: 1.5rem;
+        .countdown {
+            font-size: 4rem;
+            font-weight: 200;
+            color: #4CAF50;
             margin-bottom: 1rem;
-            width: 100%;
-            max-width: 400px;
         }
-        .approach-label {
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            color: #888;
-            margin-bottom: 0.5rem;
-        }
-        .approach h2 { font-size: 1.1rem; margin-bottom: 0.5rem; }
-        .approach p { font-size: 0.85rem; color: #aaa; margin-bottom: 1rem; line-height: 1.4; }
+        .status { font-size: 0.85rem; color: #666; }
         .btn {
             display: inline-block;
             padding: 0.75rem 1.5rem;
@@ -46,24 +36,12 @@
             text-align: center;
             cursor: pointer;
             border: none;
-            width: 100%;
-        }
-        .btn-primary { background: #4CAF50; color: #fff; }
-        .btn-secondary { background: #2a2a2a; color: #fff; border: 1px solid #444; }
-        .btn-secondary:active { background: #3a3a3a; }
-        .countdown { font-size: 2rem; font-weight: 300; color: #4CAF50; margin-bottom: 0.5rem; }
-        .status { font-size: 0.8rem; color: #666; margin-top: 0.5rem; }
-        .pwa-badge {
-            display: inline-block;
-            background: #1a73e8;
+            background: #4CAF50;
             color: #fff;
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.7rem;
-            font-weight: 600;
-            margin-bottom: 0.75rem;
+            margin-top: 1rem;
         }
         #log {
+            display: none;
             width: 100%;
             max-width: 400px;
             margin-top: 1rem;
@@ -78,86 +56,56 @@
             white-space: pre-wrap;
             word-break: break-all;
         }
+        #log.visible { display: block; }
     </style>
 </head>
 <body>
     <h1>You're connected!</h1>
-    <p class="subtitle">Choose how to continue after payment</p>
-
-    <div class="approach">
-        <div class="approach-label">Approach 1</div>
-        <h2>Auto-redirect to browser</h2>
-        <p>Automatically opens the welcome URL. Tries intent scheme first (Android), falls back to regular redirect.</p>
-        <div class="countdown" id="countdown">5</div>
-        <button class="btn btn-primary" id="btn-auto">Redirect Now</button>
-        <div class="status" id="auto-status">Counting down...</div>
-    </div>
-
-    <div class="approach">
-        <div class="approach-label">Approach 2</div>
-        <h2>Tap to open in browser</h2>
-        <p>User taps a button. Tests if links escape the captive portal WebView into the real browser.</p>
-        <a href="https://wallet.cashu.me/welcome" class="btn btn-secondary" id="btn-tap">Open Wallet in Browser</a>
-        <div class="status">If this opens in Chrome, Approach 2 works on this device.</div>
-    </div>
-
-    <div class="approach">
-        <div class="approach-label">Approach 3</div>
-        <h2>Install as PWA</h2>
-        <p>Link to a PWA-compatible page. Venues could show their menu, map, or info as an installable web app.</p>
-        <div class="pwa-badge">PWA</div>
-        <a href="https://wallet.cashu.me/welcome" class="btn btn-secondary">Open PWA Page</a>
-        <div class="status">Use browser's "Add to Home Screen" to install.</div>
-    </div>
-
+    <p class="subtitle">Redirecting you shortly...</p>
+    <div class="countdown" id="countdown">5</div>
+    <button class="btn" id="btn-now">Go Now</button>
+    <div class="status" id="status">Counting down...</div>
     <div id="log"></div>
 
     <script>
         (function() {
-            var TARGET = 'https://wallet.cashu.me/welcome';
+            var DEFAULT_TARGET = 'https://wallet.cashu.me/welcome';
+            var params = new URLSearchParams(window.location.search);
+            var TARGET = params.get('redirect') || DEFAULT_TARGET;
+            var DEBUG = params.has('debug');
+
             var log = document.getElementById('log');
             var countdownEl = document.getElementById('countdown');
-            var statusEl = document.getElementById('auto-status');
-            var btnAuto = document.getElementById('btn-auto');
+            var statusEl = document.getElementById('status');
+            var btnNow = document.getElementById('btn-now');
+
+            if (DEBUG) log.classList.add('visible');
 
             function addLog(msg) {
-                log.textContent += msg + '\n';
+                log.textContent += new Date().toISOString().substr(11, 8) + ' ' + msg + '\n';
                 log.scrollTop = log.scrollHeight;
             }
 
-            function tryIntentUrl() {
-                addLog('[approach-1] Trying intent URL for Android Chrome...');
-                var url = 'intent://wallet.cashu.me/welcome#Intent;scheme=https;package=com.android.chrome;end';
-                try {
-                    window.location.href = url;
-                    addLog('[approach-1] Intent URL set');
-                    return true;
-                } catch(e) {
-                    addLog('[approach-1] Intent URL failed: ' + e.message);
-                    return false;
-                }
-            }
-
-            function tryRegularRedirect() {
-                addLog('[approach-1] Falling back to regular redirect...');
-                window.location.href = TARGET;
-            }
-
-            function doAutoRedirect() {
+            function redirect() {
                 countdownEl.textContent = '0';
                 statusEl.textContent = 'Redirecting...';
-                addLog('[approach-1] Starting redirect sequence');
+                addLog('Redirecting to ' + TARGET);
 
-                tryIntentUrl();
+                try {
+                    window.location.href = 'intent://'
+                        + TARGET.replace('https://', '').replace('http://', '')
+                        + '#Intent;scheme=https;package=com.android.chrome;end';
+                    addLog('Intent URL dispatched (Android Chrome)');
+                } catch(e) {
+                    addLog('Intent failed: ' + e.message);
+                }
 
                 setTimeout(function() {
-                    tryRegularRedirect();
+                    window.location.href = TARGET;
                 }, 1000);
             }
 
-            btnAuto.addEventListener('click', function() {
-                doAutoRedirect();
-            });
+            btnNow.addEventListener('click', redirect);
 
             var seconds = 5;
             var timer = setInterval(function() {
@@ -165,15 +113,13 @@
                 countdownEl.textContent = seconds;
                 if (seconds <= 0) {
                     clearInterval(timer);
-                    doAutoRedirect();
+                    redirect();
                 }
             }, 1000);
 
             addLog('Welcome page loaded');
             addLog('Target: ' + TARGET);
-            addLog('UserAgent: ' + navigator.userAgent.substring(0, 80));
-            addLog('Protocol: ' + window.location.protocol);
-            addLog('Host: ' + window.location.host);
+            addLog('Debug: ' + DEBUG);
         })();
     </script>
 </body>
