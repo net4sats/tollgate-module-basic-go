@@ -24,10 +24,11 @@ type UpstreamManagerConfig struct {
 	MaxConsecutiveFailures int
 	SwitchCooldown         time.Duration
 	StartupGracePeriod     time.Duration
-	PostSwitchWait         time.Duration
-	StartupSettle         time.Duration
-	StartupRetryInterval  time.Duration
-	StartupScanInterval   time.Duration
+	PostSwitchWait        time.Duration
+	StartupSettle        time.Duration
+	StartupRetryInterval time.Duration
+	StartupScanInterval  time.Duration
+	VendorIEDiscovery    bool
 }
 
 type Connector struct {
@@ -47,6 +48,19 @@ type NetworkInfo struct {
 	StepSize     int
 	RawIEs       []byte
 	Radio        string
+	IsTollGate   bool
+	TollGateAdv  *TollGateAdvertisement
+}
+
+// TollGateAdvertisement represents the payload of a TollGate vendor-specific IE.
+// Format: OUI(3) + Type(1) + Version(1) + Flags(1) [+ optional TLV triples].
+type TollGateAdvertisement struct {
+	Version     uint8
+	IsReseller  bool
+	HasInternet bool
+	OpenNetwork bool
+	MintURL     string
+	Pubkey      []byte
 }
 
 type VendorElementProcessor struct {

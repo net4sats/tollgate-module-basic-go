@@ -287,6 +287,122 @@ func FormatScanResults(networks []NetworkInfo) string {
 	return result
 }
 
+func phyForRadio(radio string) (string, error) {
+	idx := strings.TrimPrefix(radio, "radio")
+	if idx == radio || idx == "" {
+		return "", fmt.Errorf("invalid radio name %q: expected radio<N>", radio)
+	}
+	return idx, nil
+}
+
+func (s *Scanner) ScanVendorIEs(radio string) (map[string]*TollGateAdvertisement, error) {
+	idx, err := phyForRadio(radio)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve phy for radio %q: %w", radio, err)
+	}
+
+	// iw scan requires a dev interface name, not phy<N>.
+	// Use "phy<idx>-ap0" which is the standard OpenWrt naming for the first AP on each radio.
+	devName := fmt.Sprintf("phy%s-ap0", idx)
+
+	cmd := exec.Command("iw", "dev", devName, "scan", "-u")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = nil
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("iw dev %s scan failed: %w", devName, err)
+	}
+
+	return s.ParseIwScanForVendorIEs(stdout.Bytes()), nil
+}
+
+func (s *Scanner) ParseIwScanForVendorIEs(output []byte) map[string]*TollGateAdvertisement {
+	results := make(map[string]*TollGateAdvertisement)
+
+	var currentBSSID string
+	var vendorIEBytes []byte
+
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if strings.HasPrefix(line, "BSS ") {
+			if currentBSSID != "" && len(vendorIEBytes) > 0 {
+				if adv := ParseTollGateVendorIE(vendorIEBytes); adv != nil {
+					results[currentBSSID] = adv
+				}
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				currentBSSID = strings.Split(fields[1], "(")[0]
+				vendorIEBytes = nil
+			}
+			continue
+		}
+
+		if strings.Contains(line, "Vendor specific:") && strings.Contains(line, "21:21:21") {
+			oui := extractVendorIEData(line)
+			if oui != nil {
+				vendorIEBytes = oui
+			}
+		}
+	}
+
+	if currentBSSID != "" && len(vendorIEBytes) > 0 {
+		if adv := ParseTollGateVendorIE(vendorIEBytes); adv != nil {
+			results[currentBSSID] = adv
+		}
+	}
+
+	return results
+}
+
+func extractVendorIEData(line string) []byte {
+	// Real iw output format: "Vendor specific: OUI 21:21:21, data: 01 00 01 ..."
+	// The hex bytes after "data:" are the body after OUI bytes (version + flags + optional TLVs).
+	// Build a synthetic IE: DD <len> 21 21 21 <data bytes>
+
+	dataIdx := strings.Index(line, ", data:")
+	if dataIdx < 0 {
+		return nil
+	}
+
+	hexPart := line[dataIdx+len(", data:"):]
+	hexFields := strings.Fields(hexPart)
+	var dataBytes []byte
+	for _, h := range hexFields {
+		b, err := strconv.ParseUint(h, 16, 8)
+		if err != nil {
+			break
+		}
+		dataBytes = append(dataBytes, byte(b))
+	}
+
+	if len(dataBytes) == 0 {
+		return nil
+	}
+
+	body := []byte{0x21, 0x21, 0x21}
+	body = append(body, dataBytes...)
+
+	ie := []byte{0xDD, uint8(len(body))}
+	ie = append(ie, body...)
+
+	return ie
+}
+
+func EnrichNetworksWithVendorIEs(networks []NetworkInfo, ieMap map[string]*TollGateAdvertisement) []NetworkInfo {
+	for i := range networks {
+		adv, ok := ieMap[networks[i].BSSID]
+		if ok {
+			networks[i].IsTollGate = true
+			networks[i].TollGateAdv = adv
+		}
+	}
+	return networks
+}
+
 func init() {
 	logger.WithField("module", "wireless_gateway_manager").Info("Wireless gateway manager module loaded")
 }

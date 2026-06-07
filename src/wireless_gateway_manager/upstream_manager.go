@@ -180,6 +180,8 @@ func (um *UpstreamManager) startupConnectivityCheck() {
 			continue
 		}
 
+		um.enrichWithVendorIEs(networks)
+
 		isReseller := um.isResellerModeActive()
 		candidate, err := um.findCandidates(networks, isReseller, true)
 		if err != nil || candidate == nil {
@@ -444,6 +446,47 @@ func (um *UpstreamManager) isResellerModeActive() bool {
 	return um.reseller.IsResellerModeActive()
 }
 
+type VendorIEScanner interface {
+	ScanVendorIEs(radio string) (map[string]*TollGateAdvertisement, error)
+}
+
+func (um *UpstreamManager) enrichWithVendorIEs(networks []NetworkInfo) {
+	if !um.config.VendorIEDiscovery {
+		return
+	}
+
+	vendorScanner, ok := um.scanner.(VendorIEScanner)
+	if !ok {
+		return
+	}
+
+	radiosSeen := make(map[string]bool)
+	for i := range networks {
+		if radiosSeen[networks[i].Radio] {
+			continue
+		}
+		radiosSeen[networks[i].Radio] = true
+
+		ieMap, err := vendorScanner.ScanVendorIEs(networks[i].Radio)
+		if err != nil {
+			logger.WithError(err).WithField("radio", networks[i].Radio).Debug("Vendor IE scan skipped")
+			continue
+		}
+
+		EnrichNetworksWithVendorIEs(networks, ieMap)
+	}
+
+	tollGateCount := 0
+	for _, net := range networks {
+		if net.IsTollGate {
+			tollGateCount++
+		}
+	}
+	if tollGateCount > 0 {
+		logger.WithField("count", tollGateCount).Info("Vendor IE: discovered TollGate networks")
+	}
+}
+
 func (um *UpstreamManager) runScanCycle(activeIface, activeSSID string, currentSignal int, reason string, isReseller bool) {
 	if um.isInCooldown() {
 		logger.WithField("reason", reason).Info("In cooldown period, skipping scan cycle")
@@ -457,6 +500,8 @@ func (um *UpstreamManager) runScanCycle(activeIface, activeSSID string, currentS
 		logger.WithError(err).Warn("Scan failed, retrying next cycle")
 		return
 	}
+
+	um.enrichWithVendorIEs(networks)
 
 	isEmergency := reason == "emergency"
 
@@ -654,7 +699,7 @@ func (um *UpstreamManager) findResellerCandidates(networks []NetworkInfo, isEmer
 
 		ifaceName, isExisting := existingSTAs[net.SSID]
 
-		isTollGate := strings.HasPrefix(net.SSID, "TollGate-")
+		isTollGate := net.IsTollGate || strings.HasPrefix(net.SSID, "TollGate-")
 
 		if isTollGate {
 			enc := strings.ToLower(net.Encryption)

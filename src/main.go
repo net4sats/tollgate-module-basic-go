@@ -224,12 +224,33 @@ func initUpstreamManager() {
 			SwitchCooldown:         time.Duration(cfg.UpstreamWifi.SwitchCooldownMinutes) * time.Minute,
 			StartupGracePeriod:     time.Duration(cfg.UpstreamWifi.StartupGraceSeconds) * time.Second,
 			PostSwitchWait:         time.Duration(cfg.UpstreamWifi.PostSwitchWaitSeconds) * time.Second,
+			VendorIEDiscovery:      cfg.UpstreamWifi.VendorIEDiscovery,
 		}
 	}
 
 	resellerChecker := &resellerModeAdapter{cm: configManager}
 
 	upstreamManager = wireless_gateway_manager.NewUpstreamManager(sharedConnector, sharedScanner, resellerChecker, upstreamConfig)
+
+	if upstreamConfig.VendorIEDiscovery {
+		vep := wireless_gateway_manager.NewVendorElementProcessor(sharedConnector)
+		var mintURL string
+		if cfg := configManager.GetConfig(); cfg != nil && len(cfg.AcceptedMints) > 0 {
+			mintURL = cfg.AcceptedMints[0].URL
+		}
+		adv := wireless_gateway_manager.TollGateAdvertisement{
+			Version:     1,
+			IsReseller:  configManager.GetConfig().ResellerMode,
+			HasInternet: true,
+			OpenNetwork: true,
+			MintURL:     mintURL,
+		}
+		go func() {
+			if err := wireless_gateway_manager.EmitTollGateVendorIE(vep, adv); err != nil {
+				mainLogger.WithError(err).Warn("Failed to emit TollGate vendor IE")
+			}
+		}()
+	}
 
 	go func() {
 		upstreamManager.Start(context.Background())
