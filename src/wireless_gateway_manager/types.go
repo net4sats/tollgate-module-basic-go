@@ -48,8 +48,9 @@ type NetworkInfo struct {
 	StepSize     int
 	RawIEs       []byte
 	Radio        string
-	IsTollGate   bool
-	TollGateAdv  *TollGateAdvertisement
+	IsTollGate       bool
+	IsStealthTollGate bool
+	TollGateAdv      *TollGateAdvertisement
 }
 
 // TollGateAdvertisement represents the payload of a TollGate vendor-specific IE.

@@ -699,7 +699,7 @@ func (um *UpstreamManager) findResellerCandidates(networks []NetworkInfo, isEmer
 
 		ifaceName, isExisting := existingSTAs[net.SSID]
 
-		isTollGate := net.IsTollGate || strings.HasPrefix(net.SSID, "TollGate-")
+		isTollGate := net.IsTollGate || IsTollGateSSID(net.SSID)
 
 		if isTollGate {
 			enc := strings.ToLower(net.Encryption)

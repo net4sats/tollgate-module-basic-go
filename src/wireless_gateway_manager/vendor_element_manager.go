@@ -3,6 +3,7 @@ package wireless_gateway_manager
 import (
 	"encoding/hex"
 	"fmt"
+	"os/exec"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -176,9 +177,91 @@ func (v *VendorElementProcessor) SetLocalAPVendorElements(elements map[string]st
 		"elements": elements,
 	}).Debug("SetLocalAPVendorElements: setting vendor elements on local AP")
 
+	var hexIEs []string
+	for _, h := range elements {
+		hexIEs = append(hexIEs, h)
+	}
+	combinedHex := strings.Join(hexIEs, "")
+
+	// Try UCI first (works on all drivers including mt76).
+	if err := v.SetVendorElementsViaUCI(combinedHex); err != nil {
+		logger.WithError(err).Warn("SetLocalAPVendorElements: UCI method failed, trying ubus fallback")
+	} else {
+		return nil
+	}
+
+	// Fallback: ubus runtime method.
+	return v.setVendorElementsViaUbus(elements)
+}
+
+// SetVendorElementsViaUCI writes vendor_elements to /etc/config/wireless
+// for all AP iface sections and triggers wifi reload. This works on all
+// drivers because hostapd reads vendor_elements at startup.
+func (v *VendorElementProcessor) SetVendorElementsViaUCI(hexIE string) error {
+	output, err := v.connector.ExecuteUCI("show", "wireless")
+	if err != nil {
+		return fmt.Errorf("failed to read wireless config: %w", err)
+	}
+
+	var apIfaces []string
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "=wifi-iface") {
+			continue
+		}
+		parts := strings.SplitN(line, ".", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		sectionPart := parts[1]
+		eqIdx := strings.Index(sectionPart, "=")
+		if eqIdx < 0 {
+			continue
+		}
+		ifaceName := sectionPart[:eqIdx]
+
+		modeOut, err := v.connector.ExecuteUCI("get", "wireless."+ifaceName+".mode")
+		if err != nil || strings.TrimSpace(modeOut) != "ap" {
+			continue
+		}
+
+		apIfaces = append(apIfaces, ifaceName)
+	}
+
+	if len(apIfaces) == 0 {
+		logger.Warn("SetVendorElementsViaUCI: no AP interfaces found")
+		return fmt.Errorf("no AP wifi-iface sections found")
+	}
+
+	for _, iface := range apIfaces {
+		if _, err := v.connector.ExecuteUCI("set", "wireless."+iface+".vendor_elements="+hexIE); err != nil {
+			logger.WithFields(logrus.Fields{
+				"iface": iface,
+				"error": err,
+			}).Warn("SetVendorElementsViaUCI: failed to set vendor_elements")
+			continue
+		}
+		logger.WithField("iface", iface).Debug("SetVendorElementsViaUCI: set vendor_elements")
+	}
+
+	if _, err := v.connector.ExecuteUCI("commit", "wireless"); err != nil {
+		return fmt.Errorf("failed to commit wireless config: %w", err)
+	}
+
+	cmd := exec.Command("wifi", "reload")
+	if err := cmd.Run(); err != nil {
+		logger.WithError(err).Warn("SetVendorElementsViaUCI: wifi reload failed, change will apply on next reboot")
+	} else {
+		logger.Info("SetVendorElementsViaUCI: vendor elements set, wifi reloaded")
+	}
+
+	return nil
+}
+
+func (v *VendorElementProcessor) setVendorElementsViaUbus(elements map[string]string) error {
 	output, err := v.connector.ExecuteUbus("list")
 	if err != nil {
-		logger.WithError(err).Warn("SetLocalAPVendorElements: ubus list failed, hostapd may not be running")
+		logger.WithError(err).Warn("setVendorElementsViaUbus: ubus list failed, hostapd may not be running")
 		return nil
 	}
 
@@ -191,7 +274,7 @@ func (v *VendorElementProcessor) SetLocalAPVendorElements(elements map[string]st
 	}
 
 	if len(hostapdIfaces) == 0 {
-		logger.Warn("SetLocalAPVendorElements: no hostapd interfaces found")
+		logger.Warn("setVendorElementsViaUbus: no hostapd interfaces found")
 		return nil
 	}
 
@@ -208,10 +291,10 @@ func (v *VendorElementProcessor) SetLocalAPVendorElements(elements map[string]st
 			logger.WithFields(logrus.Fields{
 				"interface": iface,
 				"error":     err,
-			}).Warn("SetLocalAPVendorElements: failed to set vendor elements on interface")
+			}).Warn("setVendorElementsViaUbus: failed to set vendor elements on interface")
 			continue
 		}
-		logger.WithField("interface", iface).Info("SetLocalAPVendorElements: vendor elements set")
+		logger.WithField("interface", iface).Info("setVendorElementsViaUbus: vendor elements set")
 	}
 
 	return nil
