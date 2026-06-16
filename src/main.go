@@ -838,9 +838,14 @@ func isLocalOrigin(origin string) bool {
 	if err != nil {
 		return false
 	}
-	ip := net.ParseIP(u.Hostname())
+	host := u.Hostname()
+	ip := net.ParseIP(host)
 	if ip == nil {
-		return u.Hostname() == "localhost"
+		// Hostname (not IP): accept localhost and local domain names
+		// like net4sats.lan, router.local, etc. These are safe for a
+		// captive portal backend that only serves on local interfaces.
+		return host == "localhost" || !strings.Contains(host, ".") ||
+			strings.HasSuffix(host, ".lan") || strings.HasSuffix(host, ".local")
 	}
 	for _, n := range privateCIDRs {
 		if n.Contains(ip) {
