@@ -30,10 +30,15 @@ var (
 // ndsctlMutex ensures only one ndsctl command runs at a time
 var ndsctlMutex = &sync.Mutex{}
 
+// ndsctlPath is the absolute path to ndsctl on OpenWrt.
+// Using an absolute path because procd services run with a minimal
+// PATH that doesn't include /usr/bin.
+const ndsctlPath = "/usr/bin/ndsctl"
+
 // authorizeMAC authorizes a MAC address using ndsctl
 func authorizeMAC(macAddress string) error {
 	ndsctlMutex.Lock()
-	cmd := exec.Command("ndsctl", "auth", macAddress)
+	cmd := exec.Command(ndsctlPath, "auth", macAddress)
 	output, err := cmd.Output()
 	ndsctlMutex.Unlock()
 
@@ -55,7 +60,7 @@ func authorizeMAC(macAddress string) error {
 // deauthorizeMAC deauthorizes a MAC address using ndsctl
 func deauthorizeMAC(macAddress string) error {
 	ndsctlMutex.Lock()
-	cmd := exec.Command("ndsctl", "deauth", macAddress)
+	cmd := exec.Command(ndsctlPath, "deauth", macAddress)
 	output, err := cmd.Output()
 	ndsctlMutex.Unlock()
 
@@ -245,7 +250,7 @@ func GetClientStats(macAddress string) (downloaded uint64, uploaded uint64, err 
 
 	// Serialize ndsctl calls to prevent concurrent execution issues
 	ndsctlMutex.Lock()
-	cmd := exec.Command("ndsctl", "json", macAddress)
+	cmd := exec.Command(ndsctlPath, "json", macAddress)
 	output, err := cmd.Output()
 	ndsctlMutex.Unlock() // Unlock immediately after command completes
 
